@@ -1,0 +1,5 @@
+/.libffi/
+/.build/
+/dist/
+/libffi-*.tar.gz
+.DS_Store

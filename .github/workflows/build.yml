@@ -1,0 +1,126 @@
+name: Build libffi
+
+# Runs on demand and on every push to main so the build is verified before
+# anything is tagged. Pushing a libffi-* tag additionally cuts a release.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['libffi-*']
+  pull_request:
+    paths:
+      - 'config.env'
+      - 'scripts/**'
+      - 'tests/**'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+# Tags are excluded from cancellation so a release is never interrupted.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  # Every Apple variant builds in about 6 seconds, so one runner builds them
+  # all in sequence; a matrix would spend more time provisioning runners than
+  # compiling.
+  apple:
+    runs-on: macos-15
+    timeout-minutes: 30
+    outputs:
+      libffi_version: ${{ steps.cfg.outputs.libffi_version }}
+      libffi_sha256: ${{ steps.cfg.outputs.libffi_sha256 }}
+      xcode_version: ${{ steps.cfg.outputs.xcode_version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: cfg
+        run: |
+          set -a; . ./config.env; set +a
+          echo "libffi_version=$LIBFFI_VERSION" >> "$GITHUB_OUTPUT"
+          echo "libffi_sha256=$LIBFFI_SHA256"   >> "$GITHUB_OUTPUT"
+          echo "xcode_version=$XCODE_VERSION"   >> "$GITHUB_OUTPUT"
+
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: ${{ steps.cfg.outputs.xcode_version }}
+
+      - name: Fetch libffi ${{ steps.cfg.outputs.libffi_version }}
+        run: scripts/fetch.sh
+
+      - name: Build every Apple variant
+        run: |
+          for variant in $(scripts/build-ios.sh --list-variants); do
+            scripts/build-ios.sh --variant "$variant"
+          done
+
+      - name: Package
+        run: |
+          for dir in dist/ios-*; do
+            name="$(basename "$dir")"
+            tar -czf "libffi-${{ steps.cfg.outputs.libffi_version }}-$name.tar.gz" -C dist "$name"
+          done
+          ls -la libffi-*.tar.gz
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libffi-ios
+          path: libffi-*-ios-*.tar.gz
+          retention-days: 7
+
+  release:
+    needs: [apple]
+    if: startsWith(github.ref, 'refs/tags/libffi-')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # The tag names the upstream version it ships; a tag that disagrees with
+      # config.env would publish one version under another's name.
+      - name: Check the tag against config.env
+        run: |
+          expected="libffi-${{ needs.apple.outputs.libffi_version }}-"
+          case "$GITHUB_REF_NAME" in
+            "$expected"[0-9]*) ;;
+            *) echo "Tag $GITHUB_REF_NAME does not match ${expected}<build number>" >&2; exit 1 ;;
+          esac
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # Consumers pin a tag and verify the archive against these rather than
+      # trusting whatever the URL returns.
+      - name: Generate checksums
+        working-directory: artifacts
+        run: |
+          sha256sum *.tar.gz | tee SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LIBFFI_VERSION: ${{ needs.apple.outputs.libffi_version }}
+          LIBFFI_SHA256: ${{ needs.apple.outputs.libffi_sha256 }}
+          XCODE_VERSION: ${{ needs.apple.outputs.xcode_version }}
+        run: |
+          {
+            echo "libffi \`$LIBFFI_VERSION\` built from \`${GITHUB_SHA}\` with Xcode \`$XCODE_VERSION\`."
+            echo
+            echo "Source: the upstream release tarball"
+            echo "[\`libffi-$LIBFFI_VERSION.tar.gz\`](https://github.com/libffi/libffi/releases/tag/v$LIBFFI_VERSION),"
+            echo "SHA-256 \`$LIBFFI_SHA256\`, unmodified."
+            echo
+            echo "Each archive holds \`lib/libffi.a\`, the architecture's generated"
+            echo "\`include/ffi.h\` and \`include/ffitarget.h\`, and upstream's \`LICENSE\`."
+            echo "Deployment targets are in \`config.env\` at this commit."
+            echo
+            echo "Verify with \`sha256sum -c SHA256SUMS\`."
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            artifacts/*.tar.gz artifacts/SHA256SUMS
